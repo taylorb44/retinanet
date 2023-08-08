@@ -18,6 +18,8 @@ from tensorflow import keras
 import matplotlib.pyplot as plt
 import tensorflow_datasets as tfds
 
+from PIL import Image
+from numpy import asarray
 
 def swap_xy(boxes):
     return tf.stack([boxes[:, 1], boxes[:, 0], boxes[:, 3], boxes[:, 2]], axis=-1)
@@ -64,8 +66,14 @@ def visualize_detections(
     plt.imshow(image)
     ax = plt.gca()
     iou_file = open('./ious/' + image_filename[:-4] + '.txt', "w")
-    for box, _cls, score in zip(boxes, classes, scores):
-        text = "{}: {:.2f}".format(_cls, score)
+    #for box, _cls, score in zip(boxes, classes, scores):
+    for box, score in zip(boxes, scores):
+        #text = "{}: {:.2f}".format(_cls, score)
+        #print(_cls)
+        #print(score)
+        # text = "{:.2f}".format(score)
+        text = "testing"
+        #print(box)
         x1, y1, x2, y2 = box
         for coord in box:
             iou_file.write(str(tf.keras.backend.get_value(coord)) + " ")
@@ -400,22 +408,8 @@ class DecodePredictions(tf.keras.layers.Layer):
         box_predictions = predictions[:, :, :4]
         cls_predictions = tf.nn.sigmoid(predictions[:, :, 4:])
         boxes = self._decode_box_predictions(anchor_boxes[None, ...], box_predictions)
-        print("boxes, classes: ")
-        print(boxes)
-        print("--")
-        print(cls_predictions)
-        print("-------------------")
-        print("nms output: ")
-        print(tf.raw_ops.CombinedNonMaxSuppression(
-            boxes=tf.expand_dims(boxes, axis=2),
-            scores=cls_predictions,
-            max_output_size_per_class=self.max_detections_per_class,
-            max_total_size=self.max_detections,
-            iou_threshold=self.nms_iou_threshold,
-            score_threshold=self.confidence_threshold,
-            clip_boxes=False,
-        ))
         return boxes, cls_predictions
+        
         '''
         return tf.raw_ops.CombinedNonMaxSuppression(
             boxes=tf.expand_dims(boxes, axis=2),
@@ -427,7 +421,7 @@ class DecodePredictions(tf.keras.layers.Layer):
             clip_boxes=False,
         )
         '''
-
+        
 
 class RetinaNetBoxLoss(tf.losses.Loss):
     """Implements Smooth L1 loss"""
@@ -573,13 +567,12 @@ weights_dir = model_dir
 latest_checkpoint = tf.train.latest_checkpoint(weights_dir)
 model.load_weights(latest_checkpoint)
 
-image = tf.keras.Input(shape=[None, None, 3], name="image")
+image = tf.keras.Input(shape=[320, 320, 3], name="image")
 predictions = model(image, training=False)
 detections = DecodePredictions(confidence_threshold=0.5)(image, predictions)
 inference_model = tf.keras.Model(inputs=image, outputs=detections)
 
-# tf.saved_model.save(inference_model, "./model_test")
-
+'''
 def prepare_image(image):
     image, _, ratio = resize_and_pad_image(image, jitter=None)
     image = tf.keras.applications.resnet.preprocess_input(image)
@@ -594,6 +587,18 @@ for sample in test_dataset.take(2):
     image = tf.cast(sample["image"], dtype=tf.float32)
     input_image, ratio = prepare_image(image)
     detections = inference_model.predict(input_image)
+    
+    boxes, cls_predictions = inference_model.predict(input_image)
+    num_detections = len(boxes[0])
+    class_names = ['unknown']
+    visualize_detections(
+            image,
+            image_filename,
+            boxes[0][:num_detections] / ratio,
+            class_names,
+            cls_predictions[0][:num_detections]
+        )
+
     num_detections = detections.valid_detections[0]
     class_names = [
         int2str(int(x)) for x in detections.nmsed_classes[0][:num_detections]
@@ -605,16 +610,53 @@ for sample in test_dataset.take(2):
         class_names,
         detections.nmsed_scores[0][:num_detections],
     )
-converter = tf.lite.TFLiteConverter.from_keras_model(inference_model)
-converter.target_spec.supported_ops = [
-  tf.lite.OpsSet.TFLITE_BUILTINS, # enable TensorFlow Lite ops.
-  tf.lite.OpsSet.SELECT_TF_OPS # enable TensorFlow ops.
-]
+'''
 
+converter = tf.lite.TFLiteConverter.from_keras_model(inference_model)
+def represent_data_gen():
+    dataset_list = tf.data.Dataset.list_files('../../training/rep_dataset/*')
+    for i in range(100):
+      image = next(iter(dataset_list))
+      print(image)
+      image = tf.io.read_file(image)
+      image = tf.io.decode_png(image, channels=3)
+      image = tf.image.resize(image, [320, 320])
+      image = tf.cast(image / 255., tf.float32)
+      image = tf.expand_dims(image, 0)
+      yield [image]
+
+converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS, tf.lite.OpsSet.SELECT_TF_OPS, tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+converter.allow_custom_ops=True
+converter.optimizations = [tf.lite.Optimize.DEFAULT]
+converter.representative_dataset = represent_data_gen
+converter.target_spec.supported_types = [tf.int8]
+converter.inference_input_type = tf.uint8
+converter.inference_output_type = tf.uint8
 tflite_model = converter.convert()
 
-interpreter = tf.lite.Interpreter(model_content=tflite_model)
+tflite_model_path = './quant_model.tflite'
+with open(tflite_model_path, 'wb') as f:
+    f.write(tflite_model)
 
-signatures = interpreter.get_signature_list()
-print('Signatures:', signatures)
-# tf.saved_model.save(inference_model, '.')
+# Load the TFLite model and allocate tensors.
+interpreter = tf.lite.Interpreter(tflite_model_path)
+interpreter.allocate_tensors()
+
+# Get input and output tensors.
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+
+print(input_details)
+print(output_details)
+
+# Test the model on random input data.
+input_shape = input_details[0]['shape']
+input_data = np.array(np.random.random_sample(input_shape), dtype=np.uint8)
+interpreter.set_tensor(input_details[0]['index'], input_data)
+
+interpreter.invoke()
+
+# The function `get_tensor()` returns a copy of the tensor data.
+# Use `tensor()` in order to get a pointer to the tensor.
+output_data = interpreter.get_tensor(output_details[0]['index'])
+print(output_data)
