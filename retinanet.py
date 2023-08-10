@@ -11,6 +11,9 @@ import os
 import re
 import zipfile
 
+from absl import app
+from absl import flags
+
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
@@ -69,11 +72,7 @@ def visualize_detections(
     #for box, _cls, score in zip(boxes, classes, scores):
     for box, score in zip(boxes, scores):
         #text = "{}: {:.2f}".format(_cls, score)
-        #print(_cls)
-        #print(score)
-        # text = "{:.2f}".format(score)
         text = "testing"
-        #print(box)
         x1, y1, x2, y2 = box
         for coord in box:
             iou_file.write(str(tf.keras.backend.get_value(coord)) + " ")
@@ -492,127 +491,13 @@ class RetinaNetLoss(tf.losses.Loss):
         loss = clf_loss + box_loss
         return loss
 
-train = False
 
-model_dir = "/home/taylor/SpottedLanternFly/keras-training/retinanet/model_test/"
-label_encoder = LabelEncoder()
-
-num_classes = 4
-batch_size = 2
-
-learning_rates = [2.5e-06, 0.000625, 0.00125, 0.0025, 0.00025, 2.5e-05]
-learning_rate_boundaries = [125, 250, 500, 240000, 360000]
-learning_rate_fn = tf.optimizers.schedules.PiecewiseConstantDecay(
-    boundaries=learning_rate_boundaries, values=learning_rates
-)
-
-resnet50_backbone = get_backbone()
-loss_fn = RetinaNetLoss(num_classes)
-model = RetinaNet(num_classes, resnet50_backbone)
-
-optimizer = tf.keras.optimizers.legacy.SGD(learning_rate=learning_rate_fn, momentum=0.9)
-model.compile(loss=loss_fn, optimizer=optimizer)
-
-callbacks_list = [
-    tf.keras.callbacks.ModelCheckpoint(
-        filepath=os.path.join(model_dir, "weights" + "_epoch_{epoch}"),
-        monitor="loss",
-        save_best_only=False,
-        save_weights_only=True,
-        verbose=1,
-    )
-]
-
-(train_dataset, test_dataset), dataset_info = tfds.load(
-    "lanternfly", split=["train", "test"], with_info=True
-)
-
-autotune = tf.data.AUTOTUNE
-train_dataset = train_dataset.map(preprocess_data, num_parallel_calls=autotune)
-train_dataset = train_dataset.shuffle(8 * batch_size)
-train_dataset = train_dataset.padded_batch(
-    batch_size=batch_size, padding_values=(0.0, 1e-8, -1), drop_remainder=True
-)
-train_dataset = train_dataset.map(
-    label_encoder.encode_batch, num_parallel_calls=autotune
-)
-train_dataset = train_dataset.apply(tf.data.experimental.ignore_errors())
-train_dataset = train_dataset.prefetch(autotune)
-
-test_dataset = test_dataset.map(preprocess_data, num_parallel_calls=autotune)
-test_dataset = test_dataset.padded_batch(
-    batch_size=1, padding_values=(0.0, 1e-8, -1), drop_remainder=True
-)
-test_dataset = test_dataset.map(label_encoder.encode_batch, num_parallel_calls=autotune)
-test_dataset = test_dataset.apply(tf.data.experimental.ignore_errors())
-test_dataset = test_dataset.prefetch(autotune)
-
-train_steps_per_epoch = dataset_info.splits["train"].num_examples // batch_size
-test_steps_per_epoch = dataset_info.splits["test"].num_examples // batch_size
-
-train_steps = 4 * 100000
-epochs = train_steps // train_steps_per_epoch
-
-if(train):
-    model.fit(
-        train_dataset,
-        validation_data=test_dataset,
-        epochs=epochs,
-        callbacks=callbacks_list,
-        verbose=1,
-    )
-
-weights_dir = model_dir
-
-latest_checkpoint = tf.train.latest_checkpoint(weights_dir)
-model.load_weights(latest_checkpoint)
-
-image = tf.keras.Input(shape=[320, 320, 3], name="image")
-predictions = model(image, training=False)
-detections = DecodePredictions(confidence_threshold=0.5)(image, predictions)
-inference_model = tf.keras.Model(inputs=image, outputs=detections)
-
-'''
 def prepare_image(image):
     image, _, ratio = resize_and_pad_image(image, jitter=None)
     image = tf.keras.applications.resnet.preprocess_input(image)
     return tf.expand_dims(image, axis=0), ratio
 
 
-test_dataset = tfds.load("lanternfly", split="all")
-int2str = dataset_info.features["objects"]["label"].int2str
-
-for sample in test_dataset.take(2):
-    image_filename = tf.keras.backend.get_value(sample["image/filename"]).decode('utf-8')
-    image = tf.cast(sample["image"], dtype=tf.float32)
-    input_image, ratio = prepare_image(image)
-    detections = inference_model.predict(input_image)
-    
-    boxes, cls_predictions = inference_model.predict(input_image)
-    num_detections = len(boxes[0])
-    class_names = ['unknown']
-    visualize_detections(
-            image,
-            image_filename,
-            boxes[0][:num_detections] / ratio,
-            class_names,
-            cls_predictions[0][:num_detections]
-        )
-
-    num_detections = detections.valid_detections[0]
-    class_names = [
-        int2str(int(x)) for x in detections.nmsed_classes[0][:num_detections]
-    ]
-    visualize_detections(
-        image,
-        image_filename,
-        detections.nmsed_boxes[0][:num_detections] / ratio,
-        class_names,
-        detections.nmsed_scores[0][:num_detections],
-    )
-'''
-
-converter = tf.lite.TFLiteConverter.from_keras_model(inference_model)
 def represent_data_gen():
     dataset_list = tf.data.Dataset.list_files('../../training/rep_dataset/*')
     for i in range(100):
@@ -625,38 +510,165 @@ def represent_data_gen():
       image = tf.expand_dims(image, 0)
       yield [image]
 
-converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS, tf.lite.OpsSet.SELECT_TF_OPS, tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-converter.allow_custom_ops=True
-converter.optimizations = [tf.lite.Optimize.DEFAULT]
-converter.representative_dataset = represent_data_gen
-converter.target_spec.supported_types = [tf.int8]
-converter.inference_input_type = tf.uint8
-converter.inference_output_type = tf.uint8
-tflite_model = converter.convert()
+def quantize_model(inference_model):
+    converter = tf.lite.TFLiteConverter.from_keras_model(inference_model)
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS, tf.lite.OpsSet.SELECT_TF_OPS, tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.allow_custom_ops=True
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset = represent_data_gen
+    converter.target_spec.supported_types = [tf.int8]
+    converter.inference_input_type = tf.uint8
+    converter.inference_output_type = tf.uint8
+    tflite_model = converter.convert()
 
-tflite_model_path = './quant_model.tflite'
-with open(tflite_model_path, 'wb') as f:
-    f.write(tflite_model)
+    tflite_model_path = './quant_model.tflite'
+    with open(tflite_model_path, 'wb') as f:
+        f.write(tflite_model)
 
-# Load the TFLite model and allocate tensors.
-interpreter = tf.lite.Interpreter(tflite_model_path)
-interpreter.allocate_tensors()
+    print('Quantized TFLite model saved at ./quant_model.tflite')
 
-# Get input and output tensors.
-input_details = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
+    interpreter = tf.lite.Interpreter(tflite_model_path)
+    interpreter.allocate_tensors()
 
-print(input_details)
-print(output_details)
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
 
-# Test the model on random input data.
-input_shape = input_details[0]['shape']
-input_data = np.array(np.random.random_sample(input_shape), dtype=np.uint8)
-interpreter.set_tensor(input_details[0]['index'], input_data)
+    print('Input details of TFLite model:')
+    print(input_details)
+    print('Output details of TFLite model:')
+    print(output_details)
 
-interpreter.invoke()
+    input_shape = input_details[0]['shape']
+    input_data = np.array(np.random.random_sample(input_shape), dtype=np.uint8)
+    interpreter.set_tensor(input_details[0]['index'], input_data)
 
-# The function `get_tensor()` returns a copy of the tensor data.
-# Use `tensor()` in order to get a pointer to the tensor.
-output_data = interpreter.get_tensor(output_details[0]['index'])
-print(output_data)
+    interpreter.invoke()
+
+    print('Interpreter successfully invoked on random test data')
+
+    return interpreter
+
+
+FLAGS = flags.FLAGS
+flags.DEFINE_boolean('train', False, 'Initiate training loop')
+flags.DEFINE_boolean('inference', False, 'Initiate inference on full dataset')
+flags.DEFINE_string('model_dir', None, 'Path to save model checkpoints')
+
+flags.mark_flag_as_required('model_dir')
+
+def main(_):
+
+    label_encoder = LabelEncoder()
+
+    num_classes = 4
+    batch_size = 2
+
+    learning_rates = [2.5e-06, 0.000625, 0.00125, 0.0025, 0.00025, 2.5e-05]
+    learning_rate_boundaries = [125, 250, 500, 240000, 360000]
+    learning_rate_fn = tf.optimizers.schedules.PiecewiseConstantDecay(
+        boundaries=learning_rate_boundaries, values=learning_rates
+    )
+
+    resnet50_backbone = get_backbone()
+    loss_fn = RetinaNetLoss(num_classes)
+    model = RetinaNet(num_classes, resnet50_backbone)
+
+    optimizer = tf.keras.optimizers.legacy.SGD(learning_rate=learning_rate_fn, momentum=0.9)
+    model.compile(loss=loss_fn, optimizer=optimizer)
+
+    callbacks_list = [
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=os.path.join(FLAGS.model_dir, "weights" + "_epoch_{epoch}"),
+            monitor="loss",
+            save_best_only=False,
+            save_weights_only=True,
+            verbose=1,
+        )
+    ]
+
+    (train_dataset, test_dataset), dataset_info = tfds.load(
+        "lanternfly", split=["train", "test"], with_info=True
+    )
+
+    autotune = tf.data.AUTOTUNE
+    train_dataset = train_dataset.map(preprocess_data, num_parallel_calls=autotune)
+    train_dataset = train_dataset.shuffle(8 * batch_size)
+    train_dataset = train_dataset.padded_batch(
+        batch_size=batch_size, padding_values=(0.0, 1e-8, -1), drop_remainder=True
+    )
+    train_dataset = train_dataset.map(
+        label_encoder.encode_batch, num_parallel_calls=autotune
+    )
+    train_dataset = train_dataset.apply(tf.data.experimental.ignore_errors())
+    train_dataset = train_dataset.prefetch(autotune)
+
+    test_dataset = test_dataset.map(preprocess_data, num_parallel_calls=autotune)
+    test_dataset = test_dataset.padded_batch(
+        batch_size=1, padding_values=(0.0, 1e-8, -1), drop_remainder=True
+    )
+    test_dataset = test_dataset.map(label_encoder.encode_batch, num_parallel_calls=autotune)
+    test_dataset = test_dataset.apply(tf.data.experimental.ignore_errors())
+    test_dataset = test_dataset.prefetch(autotune)
+
+    train_steps_per_epoch = dataset_info.splits["train"].num_examples // batch_size
+    test_steps_per_epoch = dataset_info.splits["test"].num_examples // batch_size
+
+    train_steps = 4 * 100000
+    epochs = train_steps // train_steps_per_epoch
+
+    if(FLAGS.train):
+        model.fit(
+            train_dataset,
+            validation_data=test_dataset,
+            epochs=epochs,
+            callbacks=callbacks_list,
+            verbose=1,
+        )
+
+    latest_checkpoint = tf.train.latest_checkpoint(FLAGS.model_dir)
+    model.load_weights(latest_checkpoint)
+
+    image = tf.keras.Input(shape=[320, 320, 3], name="image")
+    predictions = model(image, training=False)
+    detections = DecodePredictions(confidence_threshold=0.5)(image, predictions)
+    inference_model = tf.keras.Model(inputs=image, outputs=detections)
+
+    test_dataset = tfds.load("lanternfly", split="all")
+    int2str = dataset_info.features["objects"]["label"].int2str
+    
+    if(FLAGS.inference):
+        for sample in test_dataset:
+            image_filename = tf.keras.backend.get_value(sample["image/filename"]).decode('utf-8')
+            image = tf.cast(sample["image"], dtype=tf.float32)
+            input_image, ratio = prepare_image(image)
+    
+            boxes, cls_predictions = inference_model.predict(input_image)
+            num_detections = len(boxes[0])
+            class_names = ['unknown']
+            visualize_detections(
+                image,
+                image_filename,
+                boxes[0][:num_detections] / ratio,
+                class_names,
+                cls_predictions[0][:num_detections]
+            )
+
+            ''' 
+            detections = inference_model.predict(input_image)
+            num_detections = detections.valid_detections[0]
+            class_names = [
+                int2str(int(x)) for x in detections.nmsed_classes[0][:num_detections]
+            ]
+            visualize_detections(
+                image,
+                image_filename,
+                detections.nmsed_boxes[0][:num_detections] / ratio,
+                class_names,
+                detections.nmsed_scores[0][:num_detections],
+            )
+            '''
+    
+    interpreter = quantize_model(inference_model)
+
+if __name__ == '__main__':
+    app.run(main)
